@@ -5,6 +5,7 @@ Wires together the database, scheduler, and Telegram bot.
 
 import asyncio
 import logging
+import os
 import sys
 
 from telegram.ext import Application, CommandHandler
@@ -78,9 +79,14 @@ def main() -> None:
     db = Database(Config.DATABASE_PATH)
 
     # ── 4. Build Application ──────────────────────────────────────────────────
+    connect_timeout = int(os.getenv("CONNECT_TIMEOUT", "30"))
+    read_timeout    = int(os.getenv("READ_TIMEOUT",    "30"))
+
     app = (
         Application.builder()
         .token(Config.BOT_TOKEN)
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -103,6 +109,8 @@ def main() -> None:
     app.run_polling(
         allowed_updates=["message"],
         drop_pending_updates=True,   # ignore messages sent while bot was offline
+        # Automatically retry on network errors with exponential back-off
+        # (python-telegram-bot's built-in network_loop_retry handles reconnects)
     )
 
 

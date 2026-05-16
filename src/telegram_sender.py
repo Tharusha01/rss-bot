@@ -1,57 +1,30 @@
 """
 Telegram message formatter and sender.
-Handles rate-limiting, image attachments, HTML escaping, and retries.
+
+Strategy: Always use send_message (4096 char limit).
+Telegram automatically fetches the article's Open Graph image from the URL
+and displays it as a link preview — no send_photo needed.
+This avoids the 1024-char caption limit that cuts off long Sinhala articles.
 """
 
 import asyncio
 import logging
 from typing import Optional
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
-from telegram.helpers import escape_markdown
 
 from src.config import Config
 
 logger = logging.getLogger(__name__)
 
-# Maximum caption length allowed by Telegram for photo messages
-TELEGRAM_CAPTION_LIMIT = 1024
-# Maximum text length for a sendMessage call
-TELEGRAM_MESSAGE_LIMIT = 4096
-
-
-def _build_message_text(
-    title: str,
-    summary: str,
-    url: str,
-    source_name: str,
-) -> str:
-    """
-    Compose the Telegram message using HTML parse mode.
-    Handles Sinhala Unicode (Telegram supports it natively in HTML mode).
-
-    Format:
-        📰 <b>Title</b>
-
-        Summary text…
-
-        🔗 Read More: <a href="url">source</a>
-    """
-    # Escape HTML special characters in user-controlled content
-    safe_title   = _html_escape(title)
-    safe_summary = _html_escape(summary)
-    safe_source  = _html_escape(source_name or "Source")
-
-    lines = [
-        f"📰 <b>{safe_title}</b>",
-        "",
-        safe_summary,
-        "",
-        f'🔗 <a href="{url}">Read More — {safe_source}</a>',
-    ]
-    return "\n".join(lines)
+# Telegram's hard limits
+TELEGRAM_MESSAGE_LIMIT = 4096   # characters for send_message
+# Reserve chars for the title line + footer line + formatting markup
+_HEADER_RESERVE  = 300          # generous room for title + emoji
+_FOOTER_RESERVE  = 150          # "🔗 Read More — Source" line
+BODY_MAX_CHARS   = TELEGRAM_MESSAGE_LIMIT - _HEADER_RESERVE - _FOOTER_RESERVE  # ~3646
 
 
 def _html_escape(text: str) -> str:
@@ -64,11 +37,53 @@ def _html_escape(text: str) -> str:
     )
 
 
-def _truncate(text: str, limit: int) -> str:
-    """Truncate text to fit within Telegram limits."""
+def _truncate_body(text: str, limit: int = BODY_MAX_CHARS) -> str:
+    """
+    Truncate article body at a paragraph boundary so the message reads
+    naturally.  Appends '…' if truncated.
+    """
     if len(text) <= limit:
         return text
-    return text[: limit - 1] + "…"
+    chunk = text[:limit]
+    # Prefer paragraph break
+    para_break = chunk.rfind("\n\n")
+    if para_break > limit // 2:
+        return chunk[:para_break].strip() + "\n\n…"
+    # Fall back to word boundary
+    return chunk.rsplit(" ", 1)[0] + "…"
+
+
+def _build_message(
+    title: str,
+    body: str,
+    url: str,
+    source_name: str,
+) -> str:
+    """
+    Build the full Telegram HTML message.
+
+    Format:
+        📰 <b>Title</b>
+
+        Body text (full article, up to ~3646 chars)…
+
+        🔗 Read More — <a href="url">Source</a>
+
+    Telegram will automatically show the article's OG image as a link
+    preview from the URL, so no send_photo is required.
+    """
+    safe_title  = _html_escape(title)
+    safe_body   = _html_escape(_truncate_body(body))
+    safe_source = _html_escape(source_name or "Source")
+
+    parts = [
+        f"📰 <b>{safe_title}</b>",
+        "",
+        safe_body,
+        "",
+        f'🔗 <a href="{url}">Read More — {safe_source}</a>',
+    ]
+    return "\n".join(parts)
 
 
 async def send_article(
@@ -78,71 +93,59 @@ async def send_article(
     summary: str,
     url: str,
     source_name: str = "",
-    image_url: Optional[str] = None,
+    image_url: Optional[str] = None,   # kept for API compatibility; not used directly
     max_retries: int = None,
 ) -> bool:
     """
-    Send a formatted article message to a Telegram chat.
+    Send a formatted article to a Telegram chat.
 
-    Tries to send with a photo first; falls back to plain text on failure.
-    Handles Telegram RetryAfter (flood control) automatically.
+    Always uses send_message with disable_web_page_preview=False so Telegram
+    auto-fetches the article's OG thumbnail.  This gives the full 4096-char
+    limit instead of the 1024-char photo caption limit.
 
     Args:
         bot:         python-telegram-bot Bot instance.
-        chat_id:     Target channel/group ID or username.
+        chat_id:     Target channel/group ID or @username.
         title:       Article headline.
-        summary:     Short article summary.
-        url:         Article URL (used as "Read More" link).
-        source_name: Human-readable feed source name.
-        image_url:   Optional thumbnail URL.
+        summary:     Article body text (may be up to MAX_SUMMARY_LENGTH chars).
+        url:         Article URL — triggers Telegram link preview with image.
+        source_name: Feed source name shown in the footer link.
+        image_url:   Ignored (Telegram fetches image from the URL itself).
         max_retries: Override Config.MAX_RETRIES.
 
     Returns:
-        True on success, False on failure.
+        True on success, False after all retries exhausted.
     """
     max_retries = max_retries if max_retries is not None else Config.MAX_RETRIES
-    message_text = _build_message_text(title, summary, url, source_name)
+    message_text = _build_message(title, summary, url, source_name)
 
     for attempt in range(1, max_retries + 1):
         try:
-            if image_url:
-                caption = _truncate(message_text, TELEGRAM_CAPTION_LIMIT)
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=image_url,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                text = _truncate(message_text, TELEGRAM_MESSAGE_LIMIT)
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=False,
-                )
+            await bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=False,  # shows OG image preview from URL
+            )
             logger.info("Sent article to %s: %s", chat_id, title[:60])
             return True
 
         except RetryAfter as exc:
-            # Telegram flood control — wait the required seconds
             wait = exc.retry_after + 1
-            logger.warning("Flood control hit; waiting %ds (attempt %d)", wait, attempt)
+            logger.warning("Flood control — waiting %ds (attempt %d)", wait, attempt)
             await asyncio.sleep(wait)
 
         except TelegramError as exc:
-            if image_url and ("wrong file identifier" in str(exc).lower()
-                              or "invalid url" in str(exc).lower()):
-                # Image URL bad — retry without the image
-                logger.warning("Bad image URL; retrying without image: %s", image_url)
-                image_url = None
-                continue
-            logger.error("TelegramError sending article (attempt %d): %s", attempt, exc)
+            logger.error(
+                "TelegramError sending article (attempt %d/%d): %s", attempt, max_retries, exc
+            )
             if attempt < max_retries:
                 await asyncio.sleep(Config.RETRY_DELAY_SECONDS * attempt)
 
         except Exception as exc:
-            logger.error("Unexpected error sending article (attempt %d): %s", attempt, exc)
+            logger.error(
+                "Unexpected error sending article (attempt %d/%d): %s", attempt, max_retries, exc
+            )
             if attempt < max_retries:
                 await asyncio.sleep(Config.RETRY_DELAY_SECONDS * attempt)
 
@@ -156,11 +159,13 @@ async def send_text(
     text: str,
     parse_mode: str = ParseMode.HTML,
 ) -> None:
-    """Utility wrapper for sending plain/HTML text messages."""
+    """Utility wrapper for sending plain / HTML text messages."""
     try:
+        if len(text) > TELEGRAM_MESSAGE_LIMIT:
+            text = text[:TELEGRAM_MESSAGE_LIMIT - 1] + "…"
         await bot.send_message(
             chat_id=chat_id,
-            text=_truncate(text, TELEGRAM_MESSAGE_LIMIT),
+            text=text,
             parse_mode=parse_mode,
         )
     except TelegramError as exc:

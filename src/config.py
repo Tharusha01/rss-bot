@@ -34,7 +34,7 @@ class Config:
 
     # ── Article fetch settings ────────────────────────────────────────────────
     REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "15"))
-    MAX_SUMMARY_LENGTH: int = int(os.getenv("MAX_SUMMARY_LENGTH", "3500"))
+    MAX_SUMMARY_LENGTH: int = int(os.getenv("MAX_SUMMARY_LENGTH", "3600"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
     RETRY_DELAY_SECONDS: int = int(os.getenv("RETRY_DELAY_SECONDS", "5"))
 
