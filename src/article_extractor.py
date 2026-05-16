@@ -1,14 +1,20 @@
 """
 Article content extraction module.
-Fetches full webpage HTML and extracts clean, readable text.
-Supports Sinhala Unicode and falls back gracefully on parse failures.
+
+Extraction priority (always fetches the real webpage first):
+  1. Site-specific selectors  — div.news-content and other known Sri Lankan news layouts
+  2. readability-lxml          — Mozilla algorithm; auto-removes ads/nav
+  3. newspaper3k               — NLP-based fallback
+  4. BeautifulSoup generic     — Generic body text extraction
+  5. RSS description           — ABSOLUTE LAST RESORT only
+
+Sinhala Unicode is fully preserved (UTF-8 enforced at every stage).
 """
 
 import logging
 import re
 import time
-from typing import Optional, Tuple
-from urllib.parse import urlparse
+from typing import List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,7 +23,7 @@ from src.config import Config
 
 logger = logging.getLogger(__name__)
 
-# Request headers to mimic a real browser (reduces bot-detection blocks)
+# ── HTTP request headers ───────────────────────────────────────────────────────
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -25,135 +31,327 @@ DEFAULT_HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,si;q=0.8",  # Sinhala locale hint
+    "Accept-Language": "si-LK,si;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept-Encoding": "gzip, deflate, br",
 }
 
-# Tags that typically hold the main article body (priority order)
-ARTICLE_SELECTORS = [
+# ── Site-specific CSS selectors (tried first, in order) ───────────────────────
+# Add new selectors here when supporting additional news sites.
+SITE_SPECIFIC_SELECTORS: List[str] = [
+    # AdaDerana Sinhala / English
+    "div.news-content",
+    "div.article-body",
+    "div.news-article-body",
+    # Hiru News
+    "div.single-blog-post",
+    "div.post-inner-content",
+    # Derana / ITN
+    "div.full-article",
+    "div.entry-content",
+    # Lankadeepa / Divaina
+    "div.article-text",
+    "div.field-items",
+    "div.field-item",
+    # Generic article containers
+    "article .content",
+    "article .body",
     "article",
-    '[role="main"]',
-    ".article-body",
-    ".post-content",
-    ".entry-content",
-    ".td-post-content",
+    '[itemprop="articleBody"]',
     ".story-body",
-    "#article-body",
+    ".post-content",
+    ".td-post-content",
+    ".mvp-content-main",
+    "#article-content",
     "#main-content",
     "main",
 ]
 
-# Tags to strip from the extracted content
-NOISE_TAGS = [
+# ── Noise patterns to remove before extraction ────────────────────────────────
+_NOISE_TAG_NAMES = [
     "script", "style", "nav", "header", "footer",
-    "aside", "form", "button", "iframe", "noscript",
-    "figcaption", "figure",
+    "aside", "form", "button", "iframe", "noscript", "ins",
 ]
 
+_NOISE_CLASS_PATTERN = re.compile(
+    r"(advert|sponsor|related|social|share|comment|sidebar|widget"
+    r"|breadcrumb|tag-cloud|newsletter|popup|banner|promo"
+    r"|more-news|trending|latest-news-widget|read-also)",
+    re.IGNORECASE,
+)
+
+
+# ── Shared HTML downloader ────────────────────────────────────────────────────
 
 def _fetch_html(url: str, timeout: int, max_retries: int) -> Optional[str]:
     """
-    Download the HTML for a given URL with retry and exponential back-off.
-
-    Returns:
-        HTML string on success, None on failure.
+    Download raw HTML for *url* with retry + exponential back-off.
+    Forces UTF-8 decoding so Sinhala characters are never mangled.
     """
     for attempt in range(1, max_retries + 1):
         try:
-            response = requests.get(
+            resp = requests.get(
                 url,
                 headers=DEFAULT_HEADERS,
                 timeout=timeout,
                 allow_redirects=True,
             )
-            response.raise_for_status()
-            # Force UTF-8 to handle Sinhala characters correctly
-            response.encoding = response.apparent_encoding or "utf-8"
-            return response.text
+            resp.raise_for_status()
+
+            # Determine correct encoding for Sinhala pages
+            content_type = resp.headers.get("Content-Type", "").lower()
+            if "charset=utf-8" in content_type or "charset=utf8" in content_type:
+                resp.encoding = "utf-8"
+            else:
+                # apparent_encoding uses chardet — reliable for Sinhala
+                detected = resp.apparent_encoding or "utf-8"
+                resp.encoding = detected
+
+            return resp.text
+
         except requests.RequestException as exc:
-            logger.warning("HTML fetch error (attempt %d/%d): %s — %s", attempt, max_retries, url, exc)
+            logger.warning(
+                "HTML fetch attempt %d/%d failed for %s: %s",
+                attempt, max_retries, url, exc,
+            )
             if attempt < max_retries:
                 time.sleep(Config.RETRY_DELAY_SECONDS * attempt)
+
+    logger.error("All %d fetch attempts failed for %s", max_retries, url)
     return None
 
 
-def _extract_og_image(soup: BeautifulSoup) -> Optional[str]:
+# ── Noise removal ─────────────────────────────────────────────────────────────
+
+def _strip_noise(soup: BeautifulSoup) -> None:
+    """
+    Remove ads, navigation, sidebars, related-article widgets etc. in-place.
+    Works on both tag names and class/id attribute patterns.
+    """
+    # Remove by tag name
+    for tag in soup.find_all(_NOISE_TAG_NAMES):
+        tag.decompose()
+
+    # Remove by CSS class / id patterns
+    for tag in soup.find_all(True):
+        classes = " ".join(tag.get("class", []))
+        tag_id  = tag.get("id", "")
+        if _NOISE_CLASS_PATTERN.search(classes) or _NOISE_CLASS_PATTERN.search(tag_id):
+            tag.decompose()
+
+
+# ── Helper: extract og:image ──────────────────────────────────────────────────
+
+def _og_image(soup: BeautifulSoup) -> Optional[str]:
     """Pull Open Graph or Twitter card image from <meta> tags."""
     for prop in ("og:image", "twitter:image"):
-        tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+        tag = (
+            soup.find("meta", property=prop)
+            or soup.find("meta", attrs={"name": prop})
+        )
         if tag and tag.get("content"):
             return tag["content"].strip()
     return None
 
 
-def _extract_body_text(soup: BeautifulSoup) -> str:
+# ── Strategy 1: site-specific CSS selectors ───────────────────────────────────
+
+def _extract_via_selectors(
+    html: str,
+    url: str,
+) -> Tuple[str, Optional[str]]:
     """
-    Extract the main body text from the parsed HTML.
-    Tries known article selectors before falling back to <body>.
+    Try each selector in SITE_SPECIFIC_SELECTORS in order.
+    Returns the text of the first container that yields ≥ 150 characters.
+
+    This is the PRIMARY strategy and covers all known Sri Lankan news sites.
+
+    Returns:
+        (body_text, image_url_or_None)
     """
-    # Remove noisy elements first
-    for tag in soup.find_all(NOISE_TAGS):
-        tag.decompose()
+    try:
+        soup = BeautifulSoup(html, "html.parser")  # pure-Python, handles malformed HTML
+        image_url = _og_image(soup)
 
-    # Try specific selectors
-    for selector in ARTICLE_SELECTORS:
-        container = soup.select_one(selector)
-        if container:
-            return container.get_text(separator="\n", strip=True)
+        for selector in SITE_SPECIFIC_SELECTORS:
+            container = soup.select_one(selector)
+            if not container:
+                continue
 
-    # Generic fallback: body text
-    body = soup.find("body")
-    if body:
-        return body.get_text(separator="\n", strip=True)
+            # Work on a copy so we don't corrupt the original soup
+            container_copy = BeautifulSoup(str(container), "html.parser")
+            _strip_noise(container_copy)
 
-    return soup.get_text(separator="\n", strip=True)
+            # Preserve paragraphs — join <p> tags with double newline
+            paragraphs: List[str] = []
+            for elem in container_copy.find_all(["p", "h2", "h3", "h4", "li"]):
+                text = elem.get_text(strip=True)
+                if text:
+                    paragraphs.append(text)
 
+            if paragraphs:
+                body = "\n\n".join(paragraphs)
+            else:
+                body = container_copy.get_text(separator="\n", strip=True)
+
+            if len(body.strip()) >= 150:
+                logger.info(
+                    "Selector '%s' extracted %d chars from %s",
+                    selector, len(body), url,
+                )
+                return body, image_url
+
+    except Exception as exc:
+        logger.warning("Selector extraction failed for %s: %s", url, exc)
+
+    return "", None
+
+
+# ── Strategy 2: readability-lxml ──────────────────────────────────────────────
+
+def _extract_via_readability(html: str, url: str) -> Tuple[str, Optional[str]]:
+    """
+    Mozilla Readability algorithm — excellent for removing ads and boilerplate
+    from pages where the article container class is unknown.
+    """
+    try:
+        from readability import Document  # type: ignore
+
+        doc          = Document(html)
+        article_html = doc.summary(html_partial=True)
+
+        soup = BeautifulSoup(article_html, "html.parser")
+        paragraphs = [p.get_text(strip=True) for p in soup.find_all("p") if p.get_text(strip=True)]
+        body = "\n\n".join(paragraphs) if paragraphs else soup.get_text(separator="\n", strip=True)
+
+        if len(body.strip()) >= 150:
+            logger.info("readability-lxml extracted %d chars from %s", len(body), url)
+            return body, None
+
+    except Exception as exc:
+        logger.debug("readability-lxml failed for %s: %s", url, exc)
+
+    return "", None
+
+
+# ── Strategy 3: newspaper3k ───────────────────────────────────────────────────
+
+def _extract_via_newspaper(url: str, html: str) -> Tuple[str, Optional[str]]:
+    """
+    newspaper3k — uses NLP to detect the article block.
+    Passes the already-downloaded HTML to avoid a second request.
+    """
+    try:
+        from newspaper import Article, Config as NConfig  # type: ignore
+
+        ncfg = NConfig()
+        ncfg.browser_user_agent = DEFAULT_HEADERS["User-Agent"]
+        ncfg.fetch_images = True
+        ncfg.memoize_articles = False
+
+        article = Article(url, config=ncfg, language="si")
+        article.set_html(html)
+        article.parse()
+
+        body  = article.text or ""
+        image = article.top_image or None
+
+        if len(body.strip()) >= 150:
+            logger.info("newspaper3k extracted %d chars from %s", len(body), url)
+            return body, image
+
+    except Exception as exc:
+        logger.debug("newspaper3k failed for %s: %s", url, exc)
+
+    return "", None
+
+
+# ── Strategy 4: generic BS4 body text ────────────────────────────────────────
+
+def _extract_via_body(html: str, url: str) -> Tuple[str, Optional[str]]:
+    """Last BeautifulSoup attempt — strips all noise and returns full <body> text."""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        image_url = _og_image(soup)
+        _strip_noise(soup)
+        body = soup.find("body")
+        if body:
+            text = body.get_text(separator="\n", strip=True)
+            if len(text.strip()) >= 150:
+                logger.info("Generic body extraction got %d chars from %s", len(text), url)
+                return text, image_url
+    except Exception as exc:
+        logger.debug("Generic body extraction failed for %s: %s", url, exc)
+    return "", None
+
+
+# ── Text post-processing ──────────────────────────────────────────────────────
 
 def _clean_text(raw: str) -> str:
-    """
-    Normalise whitespace while preserving Sinhala Unicode characters.
-    Collapses multiple blank lines and trims leading/trailing spaces.
-    """
-    # Collapse consecutive blank lines
-    text = re.sub(r"\n{3,}", "\n\n", raw)
-    # Collapse multiple spaces (but not across newlines)
-    text = re.sub(r"[ \t]{2,}", " ", text)
+    """Normalise whitespace while preserving Sinhala Unicode."""
+    text = re.sub(r"\n{3,}", "\n\n", raw)      # max 2 blank lines
+    text = re.sub(r"[ \t]{2,}", " ", text)     # collapse spaces
     return text.strip()
 
 
-def _summarise(text: str, max_length: int) -> str:
+def _remove_duplicate_title(text: str, title: str) -> str:
+    """Strip headline if it appears verbatim at the very top of the body."""
+    if not title:
+        return text
+    stripped = text.strip()
+    if stripped.lower().startswith(title.lower()):
+        return stripped[len(title):].lstrip("\n: ").strip()
+    return stripped
+
+
+def _truncate_for_telegram(text: str, max_length: int) -> str:
     """
-    Return the first *max_length* characters of *text*, ending at a word boundary.
+    Truncate at a paragraph boundary so the message reads naturally.
     Appends '…' if truncated.
     """
     if len(text) <= max_length:
         return text
-    truncated = text[:max_length].rsplit(" ", 1)[0]
-    return truncated + "…"
+    # Try to cut at a paragraph boundary
+    chunk = text[:max_length]
+    para_break = chunk.rfind("\n\n")
+    if para_break > max_length // 2:
+        return chunk[:para_break].strip() + "\n\n…"
+    # Fall back to word boundary
+    return chunk.rsplit(" ", 1)[0] + "…"
 
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def extract_article(
     url: str,
     fallback_description: str = "",
+    page_title: str = "",
     max_retries: int = None,
     timeout: int = None,
     max_summary_length: int = None,
 ) -> Tuple[str, Optional[str]]:
     """
-    Fetch and extract article text and image from a URL.
+    Fetch the FULL article content from *url*.
 
-    Tries newspaper3k first (best quality), then falls back to
-    BeautifulSoup extraction, then uses the RSS description.
+    Always downloads the real webpage — never uses the RSS description
+    as the primary content source.
+
+    Extraction order:
+      1.  Site-specific CSS selectors (div.news-content etc.)
+      2.  readability-lxml
+      3.  newspaper3k
+      4.  Generic <body> text
+      5.  RSS fallback_description  ← only if the webpage cannot be reached
 
     Args:
-        url:                  Article URL to fetch.
-        fallback_description: RSS item description used as last resort.
+        url:                  Article URL to scrape.
+        fallback_description: Raw RSS item description (last resort only).
+        page_title:           Headline — used to remove duplicate title from body.
         max_retries:          Override Config.MAX_RETRIES.
         timeout:              Override Config.REQUEST_TIMEOUT.
         max_summary_length:   Override Config.MAX_SUMMARY_LENGTH.
 
     Returns:
-        (summary_text, image_url)  — image_url may be None.
+        (full_text_truncated_for_telegram, image_url_or_None)
     """
     max_retries        = max_retries        if max_retries        is not None else Config.MAX_RETRIES
     timeout            = timeout            if timeout            is not None else Config.REQUEST_TIMEOUT
@@ -162,38 +360,45 @@ def extract_article(
     image_url: Optional[str] = None
     body_text: str = ""
 
-    # ── Strategy 1: newspaper3k ──────────────────────────────────────────────
-    try:
-        from newspaper import Article  # type: ignore
-        article = Article(url, language="si")  # 'si' = Sinhala; falls back to English
-        article.download()
-        article.parse()
-        body_text = article.text or ""
-        if article.top_image:
-            image_url = article.top_image
-        logger.debug("newspaper3k extracted %d chars from %s", len(body_text), url)
-    except Exception as exc:
-        logger.debug("newspaper3k failed for %s: %s — falling back to BeautifulSoup", url, exc)
+    # ── Step 1: Always fetch the actual webpage ───────────────────────────────
+    logger.info("Fetching full article from: %s", url)
+    html = _fetch_html(url, timeout=timeout, max_retries=max_retries)
 
-    # ── Strategy 2: BeautifulSoup ────────────────────────────────────────────
-    if not body_text:
-        html = _fetch_html(url, timeout=timeout, max_retries=max_retries)
-        if html:
-            try:
-                soup = BeautifulSoup(html, "lxml")
-                if not image_url:
-                    image_url = _extract_og_image(soup)
-                body_text = _extract_body_text(soup)
-                logger.debug("BeautifulSoup extracted %d chars from %s", len(body_text), url)
-            except Exception as exc:
-                logger.warning("BeautifulSoup parse error for %s: %s", url, exc)
+    if html:
+        # ── Step 2: Site-specific selectors (PRIMARY) ─────────────────────────
+        body_text, image_url = _extract_via_selectors(html, url)
 
-    # ── Strategy 3: RSS description fallback ────────────────────────────────
-    if not body_text:
+        # ── Step 3: readability-lxml ──────────────────────────────────────────
+        if len(body_text.strip()) < 150:
+            body_text, _ = _extract_via_readability(html, url)
+
+        # ── Step 4: newspaper3k ───────────────────────────────────────────────
+        if len(body_text.strip()) < 150:
+            body_text, np_image = _extract_via_newspaper(url, html)
+            if not image_url:
+                image_url = np_image
+
+        # ── Step 5: Generic body ──────────────────────────────────────────────
+        if len(body_text.strip()) < 150:
+            body_text, bs4_image = _extract_via_body(html, url)
+            if not image_url:
+                image_url = bs4_image
+
+    # ── Step 6: RSS description — absolute last resort ────────────────────────
+    if len(body_text.strip()) < 50:
+        logger.warning(
+            "All webpage strategies failed for %s — using RSS description fallback.", url
+        )
         body_text = re.sub(r"<[^>]+>", "", fallback_description).strip()
-        logger.info("Using RSS description fallback for %s", url)
 
+    # ── Post-process ──────────────────────────────────────────────────────────
+    body_text = _remove_duplicate_title(body_text, page_title)
     body_text = _clean_text(body_text)
-    summary   = _summarise(body_text, max_summary_length)
+    # Truncate to fit Telegram's message limit with a clean paragraph break
+    result    = _truncate_for_telegram(body_text, max_summary_length)
 
-    return summary, image_url
+    logger.info(
+        "Final extraction: %d chars for %s | image=%s",
+        len(result), url, "yes" if image_url else "no",
+    )
+    return result, image_url

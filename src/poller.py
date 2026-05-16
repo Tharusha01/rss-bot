@@ -62,6 +62,7 @@ async def poll_all_feeds(bot: Bot, db: Database) -> None:
                 summary, image_url = extract_article(
                     item.url,
                     fallback_description=item.description,
+                    page_title=item.title,
                 )
             except Exception as exc:
                 logger.warning("Extraction failed for %s: %s", item.url, exc)
