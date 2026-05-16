@@ -1,0 +1,47 @@
+# RSS News Bot — .gitignore
+
+# Environment variables (NEVER commit!)
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Log files
+logs/
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
