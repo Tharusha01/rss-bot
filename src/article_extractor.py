@@ -3,6 +3,7 @@ Article content extraction module.
 
 Extraction priority (always fetches the real webpage first):
   1. Site-specific selectors  — div.news-content and other known Sri Lankan news layouts
+                                Automatically follows iframes when content div is empty
   2. readability-lxml          — Mozilla algorithm; auto-removes ads/nav
   3. newspaper3k               — NLP-based fallback
   4. BeautifulSoup generic     — Generic body text extraction
@@ -14,6 +15,7 @@ Sinhala Unicode is fully preserved (UTF-8 enforced at every stage).
 import logging
 import re
 import time
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 from typing import List, Optional, Tuple
 
 import requests
@@ -80,7 +82,84 @@ _NOISE_CLASS_PATTERN = re.compile(
 )
 
 
-# ── Shared HTML downloader ────────────────────────────────────────────────────
+# ── URL normalizer ────────────────────────────────────────────────────────────
+
+def _normalize_url(url: str) -> str:
+    """
+    Convert legacy PHP-style news URLs to their modern canonical form
+    so that article content is served directly in the HTML (not JS-loaded).
+
+    Rules applied:
+      AdaDerana Sinhala:  .../news.php?nid=NNN  ->  .../news/NNN
+      AdaDerana English:  .../news-1-NNN.html   ->  kept as-is (already works)
+
+    Any unrecognised URL is returned unchanged.
+    """
+    parsed = urlparse(url)
+    host   = parsed.netloc.lower()
+
+    # ── AdaDerana Sinhala ─────────────────────────────────────────────────────
+    # old: http://sinhala.adaderana.lk/news.php?nid=225638
+    # new: https://sinhala.adaderana.lk/news/225638
+    if "sinhala.adaderana.lk" in host and parsed.path.endswith("news.php"):
+        qs = parse_qs(parsed.query)
+        nid = qs.get("nid", [None])[0]
+        if nid:
+            normalized = f"https://sinhala.adaderana.lk/news/{nid}"
+            logger.info("URL normalized: %s -> %s", url, normalized)
+            return normalized
+
+    # ── AdaDerana English (news.php?nid=NNN) ──────────────────────────────────
+    # old: http://www.adaderana.lk/news.php?nid=99999
+    # new: https://www.adaderana.lk/news/99999
+    if "adaderana.lk" in host and "sinhala" not in host and parsed.path.endswith("news.php"):
+        qs = parse_qs(parsed.query)
+        nid = qs.get("nid", [None])[0]
+        if nid:
+            normalized = f"https://www.adaderana.lk/news/{nid}"
+            logger.info("URL normalized: %s -> %s", url, normalized)
+            return normalized
+
+    return url
+
+
+# ── Shared HTML downloader + iframe resolver ─────────────────────────────────
+
+def _resolve_iframe_html(
+    soup: BeautifulSoup,
+    base_url: str,
+    timeout: int,
+    max_retries: int,
+) -> Optional[str]:
+    """
+    If the page embeds content in an <iframe>, fetch the iframe's src URL
+    and return its HTML.  This handles sites like AdaDerana Sinhala where
+    div.news-content exists in the outer shell but is empty because the
+    real article lives inside an iframe.
+
+    Returns HTML string of the iframe page, or None if no iframe found.
+    """
+    for iframe in soup.find_all("iframe"):
+        src = iframe.get("src", "").strip()
+        if not src:
+            continue
+        # Make relative srcs absolute
+        if not src.startswith("http"):
+            src = urljoin(base_url, src)
+        # Skip ad/tracking iframes (small or clearly ad-related)
+        width  = iframe.get("width",  "999")
+        height = iframe.get("height", "999")
+        try:
+            if int(str(width).replace("%", "0"))  < 100: continue
+            if int(str(height).replace("%", "0")) < 100: continue
+        except ValueError:
+            pass
+        logger.info("Following iframe src: %s", src)
+        iframe_html = _fetch_html(src, timeout=timeout, max_retries=max_retries)
+        if iframe_html and len(iframe_html) > 500:
+            return iframe_html
+    return None
+
 
 def _fetch_html(url: str, timeout: int, max_retries: int) -> Optional[str]:
     """
@@ -158,10 +237,16 @@ def _og_image(soup: BeautifulSoup) -> Optional[str]:
 def _extract_via_selectors(
     html: str,
     url: str,
+    timeout: int = 15,
+    max_retries: int = 3,
 ) -> Tuple[str, Optional[str]]:
     """
     Try each selector in SITE_SPECIFIC_SELECTORS in order.
-    Returns the text of the first container that yields ≥ 150 characters.
+    Returns the text of the first container that yields >= 150 characters.
+
+    If a selector matches but the element is empty (content loaded in an
+    iframe), automatically fetches the iframe src and retries extraction
+    on the iframe HTML.
 
     This is the PRIMARY strategy and covers all known Sri Lankan news sites.
 
@@ -171,6 +256,28 @@ def _extract_via_selectors(
     try:
         soup = BeautifulSoup(html, "html.parser")  # pure-Python, handles malformed HTML
         image_url = _og_image(soup)
+
+        # ── Check for iframe-embedded content ─────────────────────────────────
+        # If any known selector exists but is empty, the content is likely
+        # inside an iframe (e.g. AdaDerana Sinhala).
+        for selector in SITE_SPECIFIC_SELECTORS:
+            el = soup.select_one(selector)
+            if el is not None and len(el.get_text(strip=True)) < 50:
+                # Element found but empty — check for iframes
+                iframe_html = _resolve_iframe_html(
+                    soup, base_url=url, timeout=timeout, max_retries=max_retries
+                )
+                if iframe_html:
+                    logger.info(
+                        "Selector '%s' was empty; retrying on iframe HTML", selector
+                    )
+                    # Recurse into the iframe HTML (no further iframe following)
+                    iframe_soup = BeautifulSoup(iframe_html, "html.parser")
+                    if not image_url:
+                        image_url = _og_image(iframe_soup)
+                    # Replace soup so the selector loop below works on iframe content
+                    soup = iframe_soup
+                break  # only check once
 
         for selector in SITE_SPECIFIC_SELECTORS:
             container = soup.select_one(selector)
@@ -360,13 +467,16 @@ def extract_article(
     image_url: Optional[str] = None
     body_text: str = ""
 
-    # ── Step 1: Always fetch the actual webpage ───────────────────────────────
+    # ── Step 1: Normalize URL, then always fetch the actual webpage ───────────
+    url = _normalize_url(url)
     logger.info("Fetching full article from: %s", url)
     html = _fetch_html(url, timeout=timeout, max_retries=max_retries)
 
     if html:
         # ── Step 2: Site-specific selectors (PRIMARY) ─────────────────────────
-        body_text, image_url = _extract_via_selectors(html, url)
+        body_text, image_url = _extract_via_selectors(
+            html, url, timeout=timeout, max_retries=max_retries
+        )
 
         # ── Step 3: readability-lxml ──────────────────────────────────────────
         if len(body_text.strip()) < 150:
