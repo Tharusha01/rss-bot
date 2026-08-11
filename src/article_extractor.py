@@ -15,8 +15,9 @@ Sinhala Unicode is fully preserved (UTF-8 enforced at every stage).
 import logging
 import re
 import time
+from html import unescape as html_unescape
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,6 +25,28 @@ from bs4 import BeautifulSoup
 from src.config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def _supported_encodings() -> str:
+    """
+    Build the Accept-Encoding header.
+
+    Brotli is only advertised when a decoder is actually installed — some
+    sites (e.g. irinewslk.com) answer with Content-Encoding: br whenever the
+    header allows it, and without the decoder requests hands back binary
+    garbage instead of HTML, which silently breaks every extraction strategy.
+    """
+    try:
+        import brotli  # noqa: F401
+        return "gzip, deflate, br"
+    except ImportError:
+        pass
+    try:
+        import brotlicffi  # noqa: F401
+        return "gzip, deflate, br"
+    except ImportError:
+        return "gzip, deflate"
+
 
 # ── HTTP request headers ───────────────────────────────────────────────────────
 DEFAULT_HEADERS = {
@@ -34,7 +57,7 @@ DEFAULT_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "si-LK,si;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": _supported_encodings(),
 }
 
 # ── Site-specific CSS selectors (tried first, in order) ───────────────────────
@@ -68,11 +91,63 @@ SITE_SPECIFIC_SELECTORS: List[str] = [
     "main",
 ]
 
+# ── Per-host selector overrides ───────────────────────────────────────────────
+# Tried BEFORE the generic list above so a known site never falls through to a
+# page-shell container ("main", "article") that drags in menus and widgets.
+# Only the hosts listed here change behaviour; every other feed keeps using
+# SITE_SPECIFIC_SELECTORS exactly as before.
+# NOTE: an override list is authoritative — the generic selectors are NOT
+# appended, because on these sites they match the wrong thing (irinewslk.com's
+# div.post-content is a sidebar widget holding an unrelated older story).
+SITE_SELECTOR_OVERRIDES: Dict[str, List[str]] = {
+    # Iri News — WordPress; the body is <p class="wp-block-paragraph"> inside
+    # div.entry-content (the AddToAny share block in there is stripped as noise).
+    "irinewslk.com": [
+        "div.entry-content",
+        "article div.entry-content",
+        "div.post-body",
+    ],
+}
+
+# Minimum body length for an extraction attempt to count as successful.
+MIN_BODY_CHARS = 150
+# Hosts with an explicit selector override are trusted at a lower bar — Iri News
+# posts are often two short Sinhala paragraphs, and the generic 150-char floor
+# would push them down to the truncated RSS excerpt.
+MIN_OVERRIDE_BODY_CHARS = 80
+
+
+def _selectors_for(url: str) -> Tuple[List[str], int, bool]:
+    """
+    Return (selectors_to_try, min_body_chars, is_override) for *url*.
+
+    Hosts listed in SITE_SELECTOR_OVERRIDES use only their own selectors;
+    every other host keeps the generic list and the 150-char floor, unchanged.
+    """
+    host = urlparse(url).netloc.lower().split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+
+    for domain, selectors in SITE_SELECTOR_OVERRIDES.items():
+        if host == domain or host.endswith("." + domain):
+            return selectors, MIN_OVERRIDE_BODY_CHARS, True
+
+    return SITE_SPECIFIC_SELECTORS, MIN_BODY_CHARS, False
+
 # ── Noise patterns to remove before extraction ────────────────────────────────
 _NOISE_TAG_NAMES = [
     "script", "style", "nav", "header", "footer",
     "aside", "form", "button", "iframe", "noscript", "ins",
 ]
+
+# Embedded players — following these would pull the platform's own page
+# boilerplate into the article body (Iri News embeds Facebook reels this way).
+_EMBED_HOST_PATTERN = re.compile(
+    r"(facebook\.com|fbcdn\.net|youtube\.com|youtu\.be|twitter\.com|x\.com"
+    r"|instagram\.com|tiktok\.com|dailymotion\.com|vimeo\.com|soundcloud\.com"
+    r"|doubleclick\.net|googlesyndication\.com)",
+    re.IGNORECASE,
+)
 
 _NOISE_CLASS_PATTERN = re.compile(
     r"(advert|sponsor|related|social|share|comment|sidebar|widget"
@@ -146,6 +221,10 @@ def _resolve_iframe_html(
         # Make relative srcs absolute
         if not src.startswith("http"):
             src = urljoin(base_url, src)
+        # Skip video/social embeds — their page text is not the article
+        if _EMBED_HOST_PATTERN.search(src):
+            logger.debug("Skipping embed iframe: %s", src)
+            continue
         # Skip ad/tracking iframes (small or clearly ad-related)
         width  = iframe.get("width",  "999")
         height = iframe.get("height", "999")
@@ -161,10 +240,28 @@ def _resolve_iframe_html(
     return None
 
 
+def _looks_like_html(text: Optional[str]) -> bool:
+    """
+    True if *text* is markup rather than an undecoded byte stream.
+
+    A response whose Content-Encoding we cannot decode (e.g. brotli without the
+    brotli package) still returns HTTP 200 and a non-empty body, so the only way
+    to notice is to look at the payload.
+    """
+    if not text:
+        return False
+    head = text[:4000].lower()
+    return "<html" in head or "<!doctype html" in head or "<body" in head
+
+
 def _fetch_html(url: str, timeout: int, max_retries: int) -> Optional[str]:
     """
     Download raw HTML for *url* with retry + exponential back-off.
     Forces UTF-8 decoding so Sinhala characters are never mangled.
+
+    If the body comes back as something other than markup (an encoding the
+    installed libraries cannot decompress), the request is retried once with
+    compression disabled before the attempt is considered failed.
     """
     for attempt in range(1, max_retries + 1):
         try:
@@ -185,9 +282,29 @@ def _fetch_html(url: str, timeout: int, max_retries: int) -> Optional[str]:
                 detected = resp.apparent_encoding or "utf-8"
                 resp.encoding = detected
 
-            return resp.text
+            if _looks_like_html(resp.text):
+                return resp.text
 
-        except requests.RequestException as exc:
+            logger.warning(
+                "Response from %s is not readable HTML (Content-Encoding=%s) — "
+                "retrying uncompressed.",
+                url, resp.headers.get("Content-Encoding", "none"),
+            )
+            plain_headers = {**DEFAULT_HEADERS, "Accept-Encoding": "identity"}
+            resp = requests.get(
+                url,
+                headers=plain_headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            if _looks_like_html(resp.text):
+                return resp.text
+
+            raise ValueError("Response body is not decodable HTML")
+
+        except (requests.RequestException, ValueError) as exc:
             logger.warning(
                 "HTML fetch attempt %d/%d failed for %s: %s",
                 attempt, max_retries, url, exc,
@@ -208,12 +325,19 @@ def _strip_noise(soup: BeautifulSoup) -> None:
     """
     # Remove by tag name
     for tag in soup.find_all(_NOISE_TAG_NAMES):
+        if tag.decomposed:
+            continue
         tag.decompose()
 
-    # Remove by CSS class / id patterns
+    # Remove by CSS class / id patterns.
+    # decompose() destroys the tag AND its descendants, but those descendants are
+    # still in the list we are iterating — touching one afterwards raises, so skip
+    # anything already removed (e.g. the nested AddToAny share widget on Iri News).
     for tag in soup.find_all(True):
-        classes = " ".join(tag.get("class", []))
-        tag_id  = tag.get("id", "")
+        if tag.decomposed:
+            continue
+        classes = " ".join(tag.get("class", []) or [])
+        tag_id  = tag.get("id", "") or ""
         if _NOISE_CLASS_PATTERN.search(classes) or _NOISE_CLASS_PATTERN.search(tag_id):
             tag.decompose()
 
@@ -239,10 +363,11 @@ def _extract_via_selectors(
     url: str,
     timeout: int = 15,
     max_retries: int = 3,
+    min_chars: int = MIN_BODY_CHARS,
 ) -> Tuple[str, Optional[str]]:
     """
-    Try each selector in SITE_SPECIFIC_SELECTORS in order.
-    Returns the text of the first container that yields >= 150 characters.
+    Try each selector returned by _selectors_for(url) in order.
+    Returns the text of the first container that yields >= min_chars characters.
 
     If a selector matches but the element is empty (content loaded in an
     iframe), automatically fetches the iframe src and retries extraction
@@ -254,13 +379,14 @@ def _extract_via_selectors(
         (body_text, image_url_or_None)
     """
     try:
+        selectors, _, _is_override = _selectors_for(url)
         soup = BeautifulSoup(html, "html.parser")  # pure-Python, handles malformed HTML
         image_url = _og_image(soup)
 
         # ── Check for iframe-embedded content ─────────────────────────────────
         # If any known selector exists but is empty, the content is likely
         # inside an iframe (e.g. AdaDerana Sinhala).
-        for selector in SITE_SPECIFIC_SELECTORS:
+        for selector in selectors:
             el = soup.select_one(selector)
             if el is not None and len(el.get_text(strip=True)) < 50:
                 # Element found but empty — check for iframes
@@ -279,7 +405,7 @@ def _extract_via_selectors(
                     soup = iframe_soup
                 break  # only check once
 
-        for selector in SITE_SPECIFIC_SELECTORS:
+        for selector in selectors:
             container = soup.select_one(selector)
             if not container:
                 continue
@@ -300,7 +426,7 @@ def _extract_via_selectors(
             else:
                 body = container_copy.get_text(separator="\n", strip=True)
 
-            if len(body.strip()) >= 150:
+            if len(body.strip()) >= min_chars:
                 logger.info(
                     "Selector '%s' extracted %d chars from %s",
                     selector, len(body), url,
@@ -469,27 +595,31 @@ def extract_article(
 
     # ── Step 1: Normalize URL, then always fetch the actual webpage ───────────
     url = _normalize_url(url)
+    _, min_chars, is_override = _selectors_for(url)
     logger.info("Fetching full article from: %s", url)
     html = _fetch_html(url, timeout=timeout, max_retries=max_retries)
 
     if html:
         # ── Step 2: Site-specific selectors (PRIMARY) ─────────────────────────
         body_text, image_url = _extract_via_selectors(
-            html, url, timeout=timeout, max_retries=max_retries
+            html, url, timeout=timeout, max_retries=max_retries, min_chars=min_chars
         )
 
         # ── Step 3: readability-lxml ──────────────────────────────────────────
-        if len(body_text.strip()) < 150:
+        if len(body_text.strip()) < min_chars:
             body_text, _ = _extract_via_readability(html, url)
 
         # ── Step 4: newspaper3k ───────────────────────────────────────────────
-        if len(body_text.strip()) < 150:
+        if len(body_text.strip()) < min_chars:
             body_text, np_image = _extract_via_newspaper(url, html)
             if not image_url:
                 image_url = np_image
 
         # ── Step 5: Generic body ──────────────────────────────────────────────
-        if len(body_text.strip()) < 150:
+        # Skipped for override hosts: we know exactly where their body lives, so
+        # an empty container means the post has no text (e.g. an Iri News video
+        # post) and dumping the whole page would post navigation as the article.
+        if len(body_text.strip()) < min_chars and not is_override:
             body_text, bs4_image = _extract_via_body(html, url)
             if not image_url:
                 image_url = bs4_image
@@ -499,7 +629,8 @@ def extract_article(
         logger.warning(
             "All webpage strategies failed for %s — using RSS description fallback.", url
         )
-        body_text = re.sub(r"<[^>]+>", "", fallback_description).strip()
+        # unescape() so a double-encoded feed entity (&#8230;) never reaches Telegram
+        body_text = html_unescape(re.sub(r"<[^>]+>", "", fallback_description)).strip()
 
     # ── Post-process ──────────────────────────────────────────────────────────
     body_text = _remove_duplicate_title(body_text, page_title)

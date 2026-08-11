@@ -13,7 +13,7 @@ from typing import Optional
 
 from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 
 from src.config import Config
 
@@ -134,6 +134,17 @@ async def send_article(
             wait = exc.retry_after + 1
             logger.warning("Flood control — waiting %ds (attempt %d)", wait, attempt)
             await asyncio.sleep(wait)
+
+        except (BadRequest, Forbidden) as exc:
+            # Permanent — the chat is wrong or the bot has no access there.
+            # Retrying cannot fix it, so fail fast with an actionable message.
+            logger.error(
+                "Cannot post to chat %s: %s. The feed's stored channel_id is likely "
+                "stale (it is set from CHANNEL_ID when the feed is added, not at send "
+                "time) or the bot is not an admin of that channel.",
+                chat_id, exc,
+            )
+            return False
 
         except TelegramError as exc:
             logger.error(

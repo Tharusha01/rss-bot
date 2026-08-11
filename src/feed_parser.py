@@ -6,6 +6,7 @@ Handles URL extraction from descriptions and retries on network errors.
 import logging
 import re
 import time
+from html import unescape as html_unescape
 from dataclasses import dataclass, field
 from typing import List, Optional
 from urllib.parse import urlparse
@@ -164,7 +165,9 @@ def fetch_feed(
         articles.append(ArticleItem(
             title=entry.get("title", "No Title").strip(),
             url=primary_url,
-            description=re.sub(r"<[^>]+>", "", description_raw).strip(),
+            # WordPress feeds (Iri News) double-encode their excerpt ellipsis,
+            # so feedparser leaves a literal "&#8230;" behind — unescape it.
+            description=html_unescape(re.sub(r"<[^>]+>", "", description_raw)).strip(),
             image_url=_extract_image_from_entry(entry),
             published=entry.get("published", ""),
             source_name=feed_title,

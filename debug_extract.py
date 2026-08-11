@@ -17,14 +17,9 @@ if hasattr(sys.stdout, "reconfigure"):
 import requests
 from bs4 import BeautifulSoup
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "si-LK,si;q=0.9,en-US;q=0.8",
-}
+# Use the bot's real headers — a debug run with different ones hides
+# encoding problems (a br-compressed reply the bot cannot decode).
+from src.article_extractor import DEFAULT_HEADERS as HEADERS
 
 SELECTORS_TO_TEST = [
     "div.news-content",
