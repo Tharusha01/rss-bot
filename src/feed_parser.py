@@ -9,7 +9,7 @@ import time
 from html import unescape as html_unescape
 from dataclasses import dataclass, field
 from typing import List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import feedparser
 import requests
@@ -23,6 +23,18 @@ URL_PATTERN = re.compile(r'https?://[^\s\'"<>\]]+', re.UNICODE)
 
 # Common image extensions used for thumbnail detection
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+# Vanity hosts that 301-redirect every path back to the site root.  Left alone,
+# the bot would scrape and post the homepage instead of the article, and the
+# "Read More" link would strand readers on the front page.
+#   AdaDerana Sinhala (Aug 2026): rss.xml links to adaderanasinhala.lk/news/NNN,
+#   which CloudFront redirects to https://sinhala.adaderana.lk/ — dropping the
+#   path.  The canonical host serves the very same ID directly, so swap the host
+#   and keep the path.
+HOST_REWRITES = {
+    "adaderanasinhala.lk": "sinhala.adaderana.lk",
+    "www.adaderanasinhala.lk": "sinhala.adaderana.lk",
+}
 
 
 @dataclass
@@ -72,6 +84,25 @@ def _extract_image_from_entry(entry: feedparser.FeedParserDict) -> Optional[str]
         return img_match.group(1)
 
     return None
+
+
+def _rewrite_host(url: str) -> str:
+    """
+    Swap a known redirect-to-root vanity host for its canonical equivalent,
+    preserving path and query. Unrecognised hosts are returned unchanged.
+    """
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    canonical = HOST_REWRITES.get(parsed.netloc.lower())
+    if not canonical:
+        return url
+    rewritten = urlunparse(parsed._replace(scheme="https", netloc=canonical))
+    logger.debug("Host rewritten: %s -> %s", url, rewritten)
+    return rewritten
 
 
 def _clean_url(url: str) -> str:
@@ -140,7 +171,7 @@ def fetch_feed(
 
     for entry in parsed.entries:
         # ── Resolve primary article URL ────────────────────────────────────────
-        primary_url = entry.get("link", "")
+        primary_url = _rewrite_host(entry.get("link", ""))
 
         # If the entry link points to a redirect or is missing, try extracting
         # from the raw description (common in AdaDerana-style feeds)
@@ -149,7 +180,7 @@ def fetch_feed(
             or getattr(entry, "description", "")
             or ""
         )
-        extra_urls = [_clean_url(u) for u in _extract_urls_from_text(description_raw)]
+        extra_urls = [_rewrite_host(_clean_url(u)) for u in _extract_urls_from_text(description_raw)]
         extra_urls = [u for u in extra_urls if _is_valid_url(u) and u != primary_url]
 
         # Prefer first URL from description if primary is empty/invalid

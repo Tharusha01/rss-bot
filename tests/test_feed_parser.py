@@ -3,7 +3,12 @@ Unit tests for the feed parser module.
 """
 
 import pytest
-from src.feed_parser import _extract_urls_from_text, _clean_url, _is_valid_url
+from src.feed_parser import (
+    _extract_urls_from_text,
+    _clean_url,
+    _is_valid_url,
+    _rewrite_host,
+)
 
 
 def test_extract_urls_from_plain_text():
@@ -40,3 +45,35 @@ def test_is_valid_url_rejects_bad():
     assert _is_valid_url("not-a-url") is False
     assert _is_valid_url("ftp://example.com") is False
     assert _is_valid_url("") is False
+
+
+def test_rewrite_host_adaderana_sinhala():
+    """
+    The rss.xml feed links to adaderanasinhala.lk, which 301s every path to the
+    site root — so the path must be carried over to the canonical host instead.
+    """
+    assert (
+        _rewrite_host("https://adaderanasinhala.lk/news/250130")
+        == "https://sinhala.adaderana.lk/news/250130"
+    )
+    assert (
+        _rewrite_host("https://www.adaderanasinhala.lk/news/250130")
+        == "https://sinhala.adaderana.lk/news/250130"
+    )
+
+
+def test_rewrite_host_preserves_query_and_upgrades_scheme():
+    assert (
+        _rewrite_host("http://adaderanasinhala.lk/news/1?x=2")
+        == "https://sinhala.adaderana.lk/news/1?x=2"
+    )
+
+
+def test_rewrite_host_leaves_other_hosts_untouched():
+    for url in (
+        "https://sinhala.adaderana.lk/news/250130",
+        "https://irinewslk.com/feed/",
+        "https://adaderana.lk/news/cmt2ezelm0004356pm9bgfgai",
+        "",
+    ):
+        assert _rewrite_host(url) == url

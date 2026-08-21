@@ -100,6 +100,17 @@ SITE_SPECIFIC_SELECTORS: List[str] = [
 # appended, because on these sites they match the wrong thing (irinewslk.com's
 # div.post-content is a sidebar widget holding an unrelated older story).
 SITE_SELECTOR_OVERRIDES: Dict[str, List[str]] = {
+    # AdaDerana (Sinhala + English) — Next.js rebuild, Aug 2026.  div.news-content
+    # no longer exists and the rebuilt page has no semantic containers left, so the
+    # generic list fell through to "main" — which swallows the sidebar's
+    # related-headline list and posted articles as a wall of other stories' titles
+    # (131 chars of real body inside 3076 chars of links).  div.prose is Tailwind
+    # Typography's content wrapper and holds the article body exactly.  The key
+    # matches sinhala.adaderana.lk, adaderana.lk and www.adaderana.lk alike.
+    "adaderana.lk": [
+        "div.prose",
+        "article div.prose",
+    ],
     # Iri News — WordPress; the body is <p class="wp-block-paragraph"> inside
     # div.entry-content (the AddToAny share block in there is stripped as noise).
     "irinewslk.com": [
@@ -112,8 +123,9 @@ SITE_SELECTOR_OVERRIDES: Dict[str, List[str]] = {
 # Minimum body length for an extraction attempt to count as successful.
 MIN_BODY_CHARS = 150
 # Hosts with an explicit selector override are trusted at a lower bar — Iri News
-# posts are often two short Sinhala paragraphs, and the generic 150-char floor
-# would push them down to the truncated RSS excerpt.
+# posts are often two short Sinhala paragraphs, and AdaDerana briefs run as short
+# as ~130 chars; the generic 150-char floor would push both down to the truncated
+# RSS excerpt (which, on AdaDerana's new feed, is just the headline again).
 MIN_OVERRIDE_BODY_CHARS = 80
 
 
