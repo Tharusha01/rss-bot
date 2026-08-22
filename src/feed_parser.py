@@ -24,6 +24,21 @@ URL_PATTERN = re.compile(r'https?://[^\s\'"<>\]]+', re.UNICODE)
 # Common image extensions used for thumbnail detection
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 
+USER_AGENT = "RSSNewsBot/1.0 (+https://github.com/your-org/rss-bot)"
+
+# Characters that survive a copy-paste but are invisible in Telegram.
+_INVISIBLE_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
+
+# Telegram copy-paste tends to weld the message clock onto the end of a URL
+# ("https://sinhala.adaderana.lk/rss.xml08:54").  AdaDerana answers such a path
+# with HTTP 200 and its homepage HTML, so the mistake is invisible until parsing
+# fails.  Only strip the clock when it is glued straight onto a letter, so real
+# time-bearing paths (/2026-08-21/09:00) survive untouched.
+_GLUED_CLOCK_RE = re.compile(r"(?<=[A-Za-z])\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?$")
+
+# Quotes/brackets a URL is often wrapped in when pasted from chat or a browser.
+_WRAPPER_CHARS = "<>\"'()[]{}«»“”‘’"
+
 # Vanity hosts that 301-redirect every path back to the site root.  Left alone,
 # the bot would scrape and post the homepage instead of the article, and the
 # "Read More" link would strand readers on the front page.
@@ -119,6 +134,57 @@ def _is_valid_url(url: str) -> bool:
         return False
 
 
+def sanitize_feed_url(url: str) -> str:
+    """
+    Clean a feed URL typed or pasted into a bot command.
+
+    Removes invisible characters, wrapping quotes/brackets, trailing punctuation
+    and a chat timestamp accidentally glued to the end.  Returns the URL
+    unchanged when there is nothing to strip.
+    """
+    cleaned = _INVISIBLE_RE.sub("", url or "").strip()
+    cleaned = cleaned.strip(_WRAPPER_CHARS).strip()
+
+    previous = None
+    while cleaned != previous:
+        previous = cleaned
+        cleaned = _GLUED_CLOCK_RE.sub("", cleaned)
+        cleaned = cleaned.rstrip(".,;:!?…").rstrip()
+    return cleaned
+
+
+def diagnose_feed(feed_url: str, timeout: int = None) -> str:
+    """
+    Explain, in one human-readable line, why a feed produced no entries.
+
+    Used by the bot commands so a failed /addfeed says what actually went wrong
+    instead of a blanket "check the URL".
+    """
+    timeout = timeout if timeout is not None else Config.REQUEST_TIMEOUT
+    try:
+        response = requests.get(feed_url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+    except requests.RequestException as exc:
+        return f"could not reach the server ({type(exc).__name__})"
+
+    if response.status_code >= 400:
+        return f"the server returned HTTP {response.status_code}"
+
+    parsed = feedparser.parse(response.content)
+    if parsed.entries:
+        return "the feed works now — the earlier attempt hit a temporary network error"
+
+    content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    body_start = response.content.lstrip()[:20].lower()
+    if "html" in content_type or body_start.startswith((b"<!doctype html", b"<html")):
+        return (
+            f"the server sent a web page ({content_type or 'unknown content type'}), "
+            "not an RSS feed — the URL most likely has a typo or extra characters"
+        )
+    if parsed.bozo:
+        return f"the response is not valid RSS/Atom ({parsed.bozo_exception})"
+    return "the feed is valid but currently lists no articles"
+
+
 def fetch_feed(
     feed_url: str,
     feed_id: int = 0,
@@ -146,9 +212,7 @@ def fetch_feed(
         try:
             logger.debug("Fetching feed (attempt %d/%d): %s", attempt, max_retries, feed_url)
             # feedparser can download directly; pass etag/modified for caching later
-            parsed = feedparser.parse(feed_url, request_headers={
-                "User-Agent": "RSSNewsBot/1.0 (+https://github.com/your-org/rss-bot)"
-            })
+            parsed = feedparser.parse(feed_url, request_headers={"User-Agent": USER_AGENT})
             if parsed.bozo and not parsed.entries:
                 raise ValueError(f"Bozo feed: {parsed.bozo_exception}")
             break

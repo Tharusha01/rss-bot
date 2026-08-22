@@ -5,6 +5,7 @@ All feed-management commands are admin-only.
 
 import asyncio
 import logging
+from html import escape
 from typing import Optional
 
 from telegram import Update
@@ -14,7 +15,7 @@ from telegram.ext import ContextTypes
 from src.article_extractor import extract_article
 from src.config import Config
 from src.database import Database
-from src.feed_parser import fetch_feed
+from src.feed_parser import diagnose_feed, fetch_feed, sanitize_feed_url
 from src.telegram_sender import send_article, send_text
 
 logger = logging.getLogger(__name__)
@@ -75,17 +76,38 @@ async def cmd_add_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    url = context.args[0].strip()
+    raw_url = context.args[0].strip()
+    url = sanitize_feed_url(raw_url)
     if not url.startswith(("http://", "https://")):
         await update.message.reply_text("⚠️ Please provide a valid HTTP/HTTPS URL.")
         return
 
+    # Pasting a URL out of a Telegram message often welds the message clock onto
+    # the end of it.  Say what was stripped rather than quietly adding a feed
+    # under a URL the admin never typed.
+    cleanup_note = ""
+    if url != raw_url:
+        logger.info("Sanitised /addfeed URL: %r -> %r", raw_url, url)
+        cleanup_note = f"\n🧹 Stray characters removed from your input: <code>{escape(raw_url)}</code>"
+
+    if any(feed["url"] == url for feed in db.get_active_feeds()):
+        await update.message.reply_text(
+            f"ℹ️ That feed is already active:\n<code>{escape(url)}</code>{cleanup_note}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     # Quick validation: try to fetch a couple of entries
-    await update.message.reply_text(f"🔍 Validating feed: <code>{url}</code>…", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        f"🔍 Validating feed: <code>{escape(url)}</code>…", parse_mode=ParseMode.HTML
+    )
     articles = fetch_feed(url, max_retries=1)
     if not articles:
+        reason = diagnose_feed(url)
         await update.message.reply_text(
-            "❌ Could not fetch entries from that feed. Please check the URL."
+            f"❌ Could not fetch entries — {escape(reason)}\n"
+            f"📡 <code>{escape(url)}</code>{cleanup_note}",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -93,8 +115,8 @@ async def cmd_add_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if added:
         await update.message.reply_text(
             f"✅ Feed added successfully!\n"
-            f"📡 <code>{url}</code>\n"
-            f"Found {len(articles)} article(s).",
+            f"📡 <code>{escape(url)}</code>\n"
+            f"Found {len(articles)} article(s).{cleanup_note}",
             parse_mode=ParseMode.HTML,
         )
     else:
@@ -115,11 +137,11 @@ async def cmd_remove_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    url = context.args[0].strip()
+    url = sanitize_feed_url(context.args[0].strip())
     removed = db.remove_feed(url)
     if removed:
         await update.message.reply_text(
-            f"🗑 Feed removed:\n<code>{url}</code>",
+            f"🗑 Feed removed:\n<code>{escape(url)}</code>",
             parse_mode=ParseMode.HTML,
         )
     else:
@@ -161,12 +183,16 @@ async def cmd_test_feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    url = context.args[0].strip()
-    await update.message.reply_text(f"⏳ Testing feed: <code>{url}</code>…", parse_mode=ParseMode.HTML)
+    url = sanitize_feed_url(context.args[0].strip())
+    await update.message.reply_text(f"⏳ Testing feed: <code>{escape(url)}</code>…", parse_mode=ParseMode.HTML)
 
     articles = fetch_feed(url, max_retries=1)
     if not articles:
-        await update.message.reply_text("❌ No articles found. Check the URL or feed format.")
+        await update.message.reply_text(
+            f"❌ No articles found — {escape(diagnose_feed(url))}\n"
+            f"📡 <code>{escape(url)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     # Take the first article and extract content

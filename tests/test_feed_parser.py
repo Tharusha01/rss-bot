@@ -4,6 +4,7 @@ Unit tests for the feed parser module.
 
 import pytest
 from src.feed_parser import (
+    sanitize_feed_url,
     _extract_urls_from_text,
     _clean_url,
     _is_valid_url,
@@ -77,3 +78,38 @@ def test_rewrite_host_leaves_other_hosts_untouched():
         "",
     ):
         assert _rewrite_host(url) == url
+
+
+# ── sanitize_feed_url ──────────────────────────────────────────────────────────
+
+def test_sanitize_strips_glued_telegram_timestamp():
+    """Copying a URL out of a Telegram message can weld the clock onto the end."""
+    assert (
+        sanitize_feed_url("https://sinhala.adaderana.lk/rss.xml08:54")
+        == "https://sinhala.adaderana.lk/rss.xml"
+    )
+    assert (
+        sanitize_feed_url("https://example.com/feed.xml9:05 PM")
+        == "https://example.com/feed.xml"
+    )
+
+
+def test_sanitize_keeps_legitimate_times_in_paths():
+    """A time preceded by a separator is part of the URL, not a pasted clock."""
+    for url in (
+        "https://example.com/2026-08-21/09:00",
+        "https://example.com/feed?t=12:30",
+    ):
+        assert sanitize_feed_url(url) == url
+
+
+def test_sanitize_strips_invisible_and_wrapping_characters():
+    assert sanitize_feed_url("  <https://example.com/feed/>  ") == "https://example.com/feed/"
+    assert sanitize_feed_url("https://example.com/feed/​") == "https://example.com/feed/"
+    assert sanitize_feed_url("https://example.com/feed/,") == "https://example.com/feed/"
+
+
+def test_sanitize_leaves_clean_url_untouched():
+    url = "https://sinhala.adaderana.lk/rss.xml"
+    assert sanitize_feed_url(url) == url
+    assert sanitize_feed_url("") == ""
